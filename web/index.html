@@ -182,7 +182,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
 
       <div class="actions">
         <button class="tile main" id="btnCam"><span class="ic"><i data-i="camera" data-s="24"></i></span><span><b>Ta bilde</b><small>Fotografer kartet</small></span></button>
-        <button class="tile" id="btnUp"><span class="ic"><i data-i="upload" data-s="24"></i></span><span><b>Last opp</b><small>Velg fra galleri</small></span></button>
+        <button class="tile" id="btnUp"><span class="ic"><i data-i="upload" data-s="24"></i></span><span><b>Last opp</b><small>Bilde eller PDF</small></span></button>
       </div>
 
       <div class="sect"><h2>Mine kart</h2><span id="count">0</span></div>
@@ -214,6 +214,11 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
     </div>
     <div class="vpwrap" id="edWrap"></div>
     <div class="panel">
+      <div class="chips" id="pdfBar" style="display:none">
+        <button class="chip" id="pgPrev" aria-label="Forrige side">‹</button>
+        <span class="chip" id="pgLbl" style="pointer-events:none">Side 1 / 1</span>
+        <button class="chip" id="pgNext" aria-label="Neste side">›</button>
+      </div>
       <div class="chips">
         <button class="chip" id="edAuto"><i data-i="wand" data-s="18"></i>Auto</button>
         <button class="chip" id="edGray"><i data-i="contrast" data-s="18"></i>Gråtone</button>
@@ -253,7 +258,7 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;bac
 <div id="toast"></div>
 <div id="busy"><div class="spin"></div><span id="busyT"></span></div>
 <input type="file" id="fileCam" accept="image/*" capture="environment" hidden>
-<input type="file" id="fileUp" accept="image/*" hidden>
+<input type="file" id="fileUp" accept="image/*,application/pdf,.pdf" hidden>
 
 <script>
 /*PURE-START*/
@@ -631,7 +636,10 @@ const toBlob=(cv,type,q)=>new Promise(r=>cv.toBlob(r,type,q));
 
 /* ---------- editor ---------- */
 const DEF={flat:.8,con:.45,br:0,sh:.6,gray:false};
-const ed={bmp:null,rot:0,base:null,work:document.createElement('canvas'),p:{...DEF},orig:false,raf:0};
+const DEFPDF={flat:0,con:.15,br:0,sh:0,gray:false}; // PDF er allerede ren vektor: ikke skjerp/jevn ut
+const defs=()=>ed.pdf?DEFPDF:DEF;
+const ed={bmp:null,rot:0,base:null,work:document.createElement('canvas'),p:{...DEF},orig:false,raf:0,pdf:null,page:1,pages:1};
+const previewDim=()=>ed.pdf?2600:1400;
 const edVP=new Viewport($('#edWrap'));
 function buildBase(maxDim){
   const sw=ed.bmp.width,sh=ed.bmp.height,rot=ed.rot%4,odd=rot%2===1;
@@ -667,20 +675,75 @@ function syncUI(){
 for(const k in SL){
   $(SL[k][0]).addEventListener('input',e=>{ed.p[k]=SL[k][1](+e.target.value);ed.orig=false;syncUI();schedulePreview()});
 }
-$('#edAuto').onclick=()=>{ed.p={...DEF};ed.orig=false;syncUI();schedulePreview()};
+$('#edAuto').onclick=()=>{ed.p={...defs()};ed.orig=false;syncUI();schedulePreview()};
 $('#edGray').onclick=()=>{ed.p.gray=!ed.p.gray;ed.orig=false;syncUI();schedulePreview()};
 $('#edOrig').onclick=()=>{ed.orig=!ed.orig;syncUI();schedulePreview()};
-$('#edRot').onclick=()=>{ed.rot=(ed.rot+1)%4;ed.base=buildBase(1400);schedulePreview()};
+$('#edRot').onclick=()=>{ed.rot=(ed.rot+1)%4;ed.base=buildBase(previewDim());schedulePreview()};
 $('#edBack').onclick=()=>history.back();
 
+/* ---- PDF (PDF.js ligger i lib/ slik at det virker uten nett) ---- */
+let pdfjsP=null;
+function loadPdfJs(){
+  if(window.pdfjsLib)return Promise.resolve();
+  if(!pdfjsP)pdfjsP=new Promise((res,rej)=>{
+    const s=document.createElement('script');s.src='lib/pdf.min.js';
+    s.onload=()=>{pdfjsLib.GlobalWorkerOptions.workerSrc='lib/pdf.worker.min.js';res()};
+    s.onerror=()=>{pdfjsP=null;rej(new Error('pdfjs'))};
+    document.head.appendChild(s);
+  });
+  return pdfjsP;
+}
+async function isPdfFile(f){
+  if(f.type==='application/pdf'||/\.pdf$/i.test(f.name||''))return true;
+  try{return (await f.slice(0,5).text())==='%PDF-'}catch(e){return false}
+}
+const PDF_MAXSIDE=5200,PDF_MAXPX=16e6;
+async function renderPdfPage(n){
+  const page=await ed.pdf.getPage(n),v1=page.getViewport({scale:1});
+  const sc=Math.min(PDF_MAXSIDE/Math.max(v1.width,v1.height),Math.sqrt(PDF_MAXPX/(v1.width*v1.height)));
+  const vp=page.getViewport({scale:sc}),c=document.createElement('canvas');
+  c.width=Math.max(1,Math.round(vp.width));c.height=Math.max(1,Math.round(vp.height));
+  const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);
+  await page.render({canvasContext:x,viewport:vp,background:'rgb(255,255,255)'}).promise;
+  if(ed.bmp&&ed.bmp.close)ed.bmp.close();
+  ed.bmp=await createImageBitmap(c);c.width=c.height=0;
+  ed.page=n;
+  $('#pgLbl').textContent=`Side ${n} / ${ed.pages}`;
+  $('#pgPrev').disabled=n<=1;$('#pgNext').disabled=n>=ed.pages;
+}
+async function gotoPage(n){
+  if(!ed.pdf||n<1||n>ed.pages||n===ed.page)return;
+  busy(true,'Tegner side '+n+' …');
+  try{await renderPdfPage(n);ed.rot=0;ed.base=buildBase(previewDim());schedulePreview()}
+  catch(e){toast('Kunne ikke vise siden')}
+  busy(false);
+}
+$('#pgPrev').onclick=()=>gotoPage(ed.page-1);
+$('#pgNext').onclick=()=>gotoPage(ed.page+1);
+
 async function openEditor(file){
-  busy(true,'Åpner bilde …');
-  try{ed.bmp=await loadBitmap(file)}catch(e){busy(false);toast('Kunne ikke åpne bildet');return}
-  ed.rot=0;ed.p={...DEF};ed.orig=false;
-  $('#mapName').value='';
+  busy(true,'Åpner …');
+  ed.pdf=null;ed.pages=1;ed.page=1;
+  $('#pdfBar').style.display='none';
+  let name='';
+  try{
+    if(await isPdfFile(file)){
+      await loadPdfJs();
+      const data=new Uint8Array(await file.arrayBuffer());
+      ed.pdf=await pdfjsLib.getDocument({data,isEvalSupported:false}).promise;
+      ed.pages=ed.pdf.numPages;
+      await renderPdfPage(1);
+      $('#pdfBar').style.display=ed.pages>1?'flex':'none';
+      name=(file.name||'').replace(/\.pdf$/i,'').slice(0,60);
+    }else{
+      ed.bmp=await loadBitmap(file);
+    }
+  }catch(e){busy(false);toast(ed.pdf||/pdf/i.test(file.type||'')?'Kunne ikke åpne PDF-en':'Kunne ikke åpne bildet');ed.pdf=null;return}
+  ed.rot=0;ed.p={...defs()};ed.orig=false;
+  $('#mapName').value=name;
   go('editor');syncUI();
   await new Promise(r=>setTimeout(r,30));
-  ed.base=buildBase(1400);schedulePreview();
+  ed.base=buildBase(previewDim());schedulePreview();
   busy(false);
 }
 $('#edSave').onclick=async()=>{
@@ -688,19 +751,19 @@ $('#edSave').onclick=async()=>{
   busy(true,'Forbedrer og lagrer …');
   await new Promise(r=>setTimeout(r,40));
   try{
-    const full=buildBase(3000);
+    const full=buildBase(ed.pdf?PDF_MAXSIDE:3000);
     if(!ed.orig) enhanceCanvas(full,ed.p);
-    const blob=await toBlob(full,'image/jpeg',0.9);
+    const blob=ed.pdf?await toBlob(full,'image/png'):await toBlob(full,'image/jpeg',0.9);
     const ts=Math.min(1,420/Math.max(full.width,full.height)),tc=document.createElement('canvas');
     tc.width=Math.round(full.width*ts);tc.height=Math.round(full.height*ts);
     const tx=tc.getContext('2d');tx.imageSmoothingQuality='high';tx.drawImage(full,0,0,tc.width,tc.height);
     const thumb=await toBlob(tc,'image/jpeg',0.8);
     const d=new Date(),pad=n=>String(n).padStart(2,'0');
     const name=$('#mapName').value.trim()||`Kart ${pad(d.getDate())}.${pad(d.getMonth()+1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    const rec={id:uid(),name,created:Date.now(),w:full.width,h:full.height,blob,thumb,stations:[],points:[],links:[],nextSt:1};
+    const rec={id:uid(),src:ed.pdf?'pdf':'img',name,created:Date.now(),w:full.width,h:full.height,blob,thumb,stations:[],points:[],links:[],nextSt:1};
     await DB.put(rec);
     maps.unshift(rec);
-    ed.bmp=null;ed.base=null;
+    ed.bmp=null;ed.base=null;ed.pdf=null;
     busy(false);
     await openMap(rec.id,true);
     toast('Kartet er lagret');
